@@ -1,21 +1,29 @@
 """
 config.py
 =========
-v0.3.4: finite-range social wave + wall crowd relaxation.
+v0.4.4 threat-loss termination + dynamic escape direction + contact-observed social source.
 
-핵심 원칙
-- 첫 반응/재반응 모두 같은 확률 hazard 사용
-- direct cue = 거리(clearance) + 실제 closing speed
-- social activation = v1식 R_C 내 ESCAPE 비율
-- social direction = 이웃의 실제 effective velocity flow를 robot threat-frame으로 정렬
-- social wave는 source에서 누적된 propagation path에 따라 감쇠
-- robot이 지나간 rear zone에서는 신규 behavioral social propagation을 차단
-- crowd pressure는 behavioral social wave와 분리하여 벽/밀집에서 수동 재배치
-- physical contact = 실제 overlap geometry correction
+목적
+- social interaction은 두 요소만 유지한다.
+  1) calm-BASE spacing attraction / short-range repulsion
+  2) previous-frame movement-following excitation
+- C_i ESCAPE fraction, 3 m social path, density path discount,
+  provenance/upstream graph, recruited-cohort memory는 사용하지 않는다.
+- behavioral locomotion과 mechanical displacement 분리는 유지한다.
+- ESCAPE direction은 매 frame robot/social/separation에서 다시 계산한다.
+- final voluntary vector는 direct threat 중 robot-inward 성분만 제거한다.
+- actual contact push는 social perception source로 허용하되 passive crowd relaxation은 제외한다.
+- threat-loss termination으로 안전해진 ESCAPE가 조기 종료될 수 있다.
+- wall relief는 이번 ablation에서 OFF한다.
 
-아래 값 중 행동 관련 숫자는 초기 개발/튜닝값이며 생물학적 상수로 간주하지 않는다.
-모든 물리량은 SI 단위(m, s, m/s, rad).
+주의
+- R_SOCIAL=0.75 m는 Febrer et al. (2006)의 "nearest bird가 약 75 cm보다
+  멀 때 후보 위치를 높은 확률로 거부한 attraction model이 자료에 가장 잘 맞았다"는
+  결과를 동적 spacing rule의 참고 거리로 옮긴 개발값이다.
+  원 논문의 force constant 또는 선호거리와 동일한 값이 아니다.
+- 행동 관련 숫자는 개발/튜닝값이며 생물학적 상수로 간주하지 않는다.
 """
+
 
 import numpy as np
 
@@ -44,19 +52,33 @@ DT = 0.05
 # Neighborhoods
 # ----------------------------------------------------------------------------
 R_MIN    = 0.14   # 자발적으로 걷는 BASE 개체의 근접 separation 조향
-R_SOCIAL = 0.55   # 자발적으로 걷는 BASE 개체의 약한 cohesion
-R_C      = 0.40   # v1식 ESCAPE 상태 전파 반경
+R_SOCIAL = 0.75   # local flock cohesion radius; development scale inspired by Febrer 2006, not a force constant
+R_C      = 0.40   # compatibility alias; simple-social excitation uses R_FLOW
 R_FLOW   = 0.45   # 실제 movement-flow 방향을 감지하는 이웃 반경
 
-# behavioral social wave의 누적 경로거리 한계.
-# 약 3 m는 현재 관찰을 맞추기 위한 개발/튜닝값이며 생물학적 상수가 아니다.
+# Local density는 social radius와 같은 공간척도에서 진단한다.
+# 별도 독립 숫자를 추가하지 않기 위해 R_C를 재사용한다.
+R_DENSITY = R_C
+
+# Simple robot-centered social-response envelope. No graph/path/provenance is used.
+# 3.0 m is a development/tuning value based on observed finite reaction extent.
 SOCIAL_PROP_RANGE = 3.0
 
-# 밀집 crowd relaxation. behavioral ESCAPE와 분리된 수동/집단 재배치.
-# 아래 값들은 v0.2 가이드의 초기 튜닝값을 시작점으로 사용한다.
+# 밀집 crowd relaxation. behavioral heading/speed mode가 아니라 passive mechanical displacement.
+# 아래 값들은 개발/튜닝값이며 생물학적 상수가 아니다.
 R_PRESSURE = 0.17
 PRESSURE_THRESHOLD = 0.20
 V_CROWD_MAX = 0.07
+
+# 과밀 jam 시작점. 이 이상에서는 voluntary locomotion이 점차 감소한다.
+# social excitation 자체를 약화시키는 값이 아니라 "몸이 빠져나갈 수 있는 mobility"만 낮춘다.
+JAM_PRESSURE = 1.50
+
+# 기본 wall rule은 tangent projection이다.
+# 아래 relief는 실제 주행 영상에서 확인한 wall-side redistribution을 위한 확장모델.
+# ablation 비교가 가능하도록 연구 옵션으로 분리한다.
+ENABLE_WALL_RELIEF = False
+WALL_RELIEF_DEPTH = 1.20
 
 # ----------------------------------------------------------------------------
 # Locomotion
@@ -97,22 +119,33 @@ ROBOT_CUE_CLEARANCE = 0.45
 DIRECT_ONSET_CLEARANCE = ROBOT_CUE_CLEARANCE
 
 # closing-speed cue는 선형 정규화한다.
-# 0.4 m/s -> 0.5, 0.8 m/s 이상 -> 1.0.
-# 속도 효과를 유지하면서 저속 비교실험에서 direct seed가 과도하게 약해지는 것을 막는다.
+# 0.2 m/s -> 0.25, 0.4 m/s -> 0.5, 0.8 m/s 이상 -> 1.0.
+# 이번 branch는 ROBOT_VEL=0.20 m/s 실행조건을 기준으로 한다.
 V_THREAT_REF = 0.80
 
 # BASE -> movement bout hazard를 direct/social로 분리한다.
 # robot: 거리+closing speed+개체 민감도
-# social: v1식 ESCAPE 비율 C_i + 개체 social sensitivity
+# social: previous-frame actual disturbance movement -> E_i excitation
+# social range/path/provenance의 별도 cascade rule은 두지 않는다.
 LAMBDA_ROBOT  = 20.0
-LAMBDA_SOCIAL = 10.0
+LAMBDA_SOCIAL = 13.0
 BETA = 0.60
 
 # old code/logger compatibility only
 LAMBDA_RESPONSE = LAMBDA_ROBOT
 
-# 이웃 effective velocity의 짧은 방향 기억
+# Legacy compatibility only. Direction is taken directly from previous-frame movement;
+# no extra directional social memory is used in v0.4.1.
 TAU_FLOW = 0.12
+
+# social cue는 이웃 source가 보인 즉시 완전히 켜지지 않고 이 시간척도로 축적/감쇠한다.
+# 실제 flock-follow는 이 excitation이 남아 있을 때만 허용해 flow-only conveyor를 막는다.
+# one-hop-per-frame 전파와 함께 섣부른 flock-wide activation을 막는 개발/튜닝값.
+TAU_SOCIAL_EXCITATION = 0.25
+
+# weak attraction은 social excitation이 거의 사라진 calm BASE에서만 허용한다.
+# 개발/튜닝 threshold이며 생물학적 상수가 아니다.
+CALM_SOCIAL_THRESHOLD = 0.05
 
 # ----------------------------------------------------------------------------
 # Habituation (robot cue only)
@@ -144,6 +177,11 @@ T_REST_MAX = 1.20
 # 거리기반 bout가 비정상적으로 오래 지속되는 경우만 끊는 safety timeout
 T_ESCAPE_MAX = 3.0
 
+# ESCAPE 중 perceived robot/social drive가 이 값 아래로 떨어지면,
+# 최소 이동거리 L_ESCAPE_MIN을 이미 이동한 경우 조기 종료한다.
+# 개발/튜닝값이며 생물학적 상수가 아니다.
+H_STOP = 0.03
+
 # ----------------------------------------------------------------------------
 # Close / sudden BURST
 # ----------------------------------------------------------------------------
@@ -155,16 +193,21 @@ BURST_QDOT_TH = 0.80
 # ----------------------------------------------------------------------------
 # Physical contact / walls
 # ----------------------------------------------------------------------------
-# v1식 실제 overlap correction. social sensitivity는 적용하지 않는다.
-CONTACT_ITERS = 2
+# 실제 overlap correction. social sensitivity는 적용하지 않는다.
+# dense contact chain에서는 adaptive iteration으로 물리 displacement가 군집 내부를 통과한다.
+# 아래 두 값은 행동 파라미터가 아니라 수치 solver 개발값이다.
+CONTACT_MAX_ITERS = 24
+CONTACT_TOLERANCE = 0.0010   # 1 mm residual penetration tolerance
+CONTACT_ITERS = CONTACT_MAX_ITERS   # old-code compatibility
 MAX_OVERLAP_PUSH = 0.02
 
 # active desired direction이 벽 밖을 향하면 normal 성분을 제거하고 tangent를 유지.
 R_WALL_FLOW = 0.25
 
 # ----------------------------------------------------------------------------
-# Rare direct low responders
-# direct robot sensitivity만 0. social-flow/contact는 정상.
+# Rare behavioral near-nonresponders
+# 약 0.5%는 robot/social behavioral sensitivity를 모두 0으로 둔다.
+# 실제 chicken/robot contact 및 crowd pressure에 의한 물리 이동은 정상.
 # ----------------------------------------------------------------------------
 LOW_RESPONDER_RATE        = 0.005
 LOW_RESPONDER_RATE_JITTER = 0.001
@@ -182,7 +225,7 @@ SETTLE_TIME = 8.0
 ROBOT_ENABLED = True
 ROBOT_RADIUS  = 0.25
 ROBOT_START   = np.array([-1.0, 2.25])
-ROBOT_VEL     = np.array([0.10, 0.0])
+ROBOT_VEL     = np.array([0.20, 0.0])
 
 # renderer의 기존 stimulus-ring 호환용.
 # 이제 중심거리 기준 ring은 direct cue가 0이 되는 surface-clearance 경계를 표시한다.
