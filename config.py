@@ -1,7 +1,7 @@
 """
 config.py
 =========
-v0.4.4 threat-loss termination + dynamic escape direction + contact-observed social source.
+v0.4.16 side-direct response + calm post-pass refill.
 
 목적
 - social interaction은 두 요소만 유지한다.
@@ -13,8 +13,16 @@ v0.4.4 threat-loss termination + dynamic escape direction + contact-observed soc
 - ESCAPE direction은 매 frame robot/social/separation에서 다시 계산한다.
 - final voluntary vector는 direct threat 중 robot-inward 성분만 제거한다.
 - actual contact push는 social perception source로 허용하되 passive crowd relaxation은 제외한다.
+- social recruitment는 robot front/rear gate 없이 local movement source 주변 전방위로 허용한다.
+- social-origin movement는 고정 8 cm cap 대신 거리/국소 밀도/social support 소실로 조기 정지한다.
+- BURST/rush는 close threat의 모든 개체가 아니라 개체 민감도와 threat rise에 따라 간헐적으로 발생한다.
 - threat-loss termination으로 안전해진 ESCAPE가 조기 종료될 수 있다.
 - wall relief는 이번 ablation에서 OFF한다.
+- 측면 통과(side-pass)는 정면 direct cue와 별도 거리창으로 보강한다.
+- direct threat에서는 robot geometry가 우세하고, threat가 약해지면 social movement flow로 자연스럽게 handoff한다.
+- 로봇 바로 근접한 개체는 refractory보다 물리적 direct threat를 우선한다.
+- wall corner에서는 두 벽을 동시에 투영하고 interior/open-space 방향을 사용한다.
+- 로봇 통과 후 빈 공간 회복은 calm BASE의 local-void refill로 유지한다.
 
 주의
 - R_SOCIAL=0.75 m는 Febrer et al. (2006)의 "nearest bird가 약 75 cm보다
@@ -95,21 +103,34 @@ TAU_STOP   = 0.12
 K_THETA   = 6.0
 OMEGA_MAX = 8.0
 
+# Robot-relative escape geometry. 0 = robot-forward only, 1 = full lateral
+# radial component. This is a development/tuning parameter for the observed
+# forward-dominant but outward-spreading response.
+ROBOT_ESCAPE_LATERAL_GAIN = 0.35  # direct initial forward/outward escape geometry
+
 # ----------------------------------------------------------------------------
 # Individual responsiveness
 # robot_sensitivity / social_sensitivity 를 독립적으로 1회 샘플링.
 # ----------------------------------------------------------------------------
-ROBOT_SENS_ALPHA = 2.0
-ROBOT_SENS_BETA  = 2.5
+# Same mean responsiveness as 2.0/2.5 (=0.444...), but a thinner lower tail.
+# This lets rare slow reactions emerge from the hazard itself without a
+# manually assigned responder class.
+ROBOT_SENS_ALPHA = 5.0
+ROBOT_SENS_BETA  = 6.25
 SOCIAL_SENS_ALPHA = 5.0
 SOCIAL_SENS_BETA  = 2.0
 
 # ----------------------------------------------------------------------------
 # Robot-threat / social-flow response
 # ----------------------------------------------------------------------------
-# surface clearance가 이 값 이상이면 direct distance cue = 0.
-# 0.8~1.0 m/s 주행에서 중앙 반응거리가 대략 15~30 cm권에 오도록 시작한 개발값.
+# surface clearance가 이 값 이상이면 정면/closing 기반 direct distance cue = 0.
+# 기존 정면 반응거리는 유지한다.
 ROBOT_CUE_CLEARANCE = 0.45
+
+# 측면 통과에서는 LOS closing speed가 거의 0이 되어 direct cue가 늦게 켜질 수 있다.
+# 정면 범위는 건드리지 않고 side-pass 전용 surface-clearance 창만 넓힌다.
+# 0.70 m는 개발/튜닝값이며, 현재 ±0.75 m 인접 라인의 늦은 반응을 보정하기 위한 시작값이다.
+SIDE_CUE_CLEARANCE = 0.70
 
 # ----------------------------------------------------------------------------
 # Renderer compatibility
@@ -138,9 +159,8 @@ LAMBDA_RESPONSE = LAMBDA_ROBOT
 # no extra directional social memory is used in v0.4.1.
 TAU_FLOW = 0.12
 
-# social cue는 이웃 source가 보인 즉시 완전히 켜지지 않고 이 시간척도로 축적/감쇠한다.
-# 실제 flock-follow는 이 excitation이 남아 있을 때만 허용해 flow-only conveyor를 막는다.
-# one-hop-per-frame 전파와 함께 섣부른 flock-wide activation을 막는 개발/튜닝값.
+# v0.4.7: 새 social source 입력은 즉시 excitation에 반영하고, source가
+# 사라진 뒤 이 tau로 지수 감쇠한다. 별도 gain parameter는 추가하지 않는다.
 TAU_SOCIAL_EXCITATION = 0.25
 
 # weak attraction은 social excitation이 거의 사라진 calm BASE에서만 허용한다.
@@ -157,11 +177,16 @@ H_MIN = 0.30
 D_EXPOSURE_TH = 0.50
 
 # ----------------------------------------------------------------------------
-# Ordinary BASE movement
+# Ordinary BASE movement / post-pass refill
 # ----------------------------------------------------------------------------
 LAMBDA_BASE_MOVE = 0.04
 BOUT_MIN = 0.5
 BOUT_MAX = 2.0
+
+# 로봇이 지나간 뒤 calm BASE 개체가 local-neighbor centroid의 반대쪽,
+# 즉 인접한 빈 공간 쪽으로 V_BASE로 천천히 재분포한다.
+# 별도 refill 속도/거리 파라미터는 두지 않고 기존 R_SOCIAL, R_MIN, V_BASE를 재사용한다.
+ENABLE_CALM_REFILL = True
 
 # ----------------------------------------------------------------------------
 # Stimulus-driven movement bout: move -> stop -> refractory -> re-evaluate cue
@@ -177,15 +202,16 @@ T_REST_MAX = 1.20
 # 거리기반 bout가 비정상적으로 오래 지속되는 경우만 끊는 safety timeout
 T_ESCAPE_MAX = 3.0
 
-# ESCAPE 중 perceived robot/social drive가 이 값 아래로 떨어지면,
-# 최소 이동거리 L_ESCAPE_MIN을 이미 이동한 경우 조기 종료한다.
+# ESCAPE persistence는 direct robot drive만 본다. Social cue는 새 bout를
+# recruit하지만 이미 움직이는 개체를 계속 끌고 가는 유지 신호로 쓰지 않는다.
+# 최소 이동거리 L_ESCAPE_MIN 이후 direct robot drive가 이 값 아래면 STOP.
 # 개발/튜닝값이며 생물학적 상수가 아니다.
 H_STOP = 0.03
 
 # ----------------------------------------------------------------------------
 # Close / sudden BURST
 # ----------------------------------------------------------------------------
-T_BURST = 0.20
+T_BURST = 0.20  # close/sudden-threat rush duration; v0.4.12 makes this target actually survive refractory override
 BURST_CLEARANCE = 0.15
 # dQ_robot+/dt가 이 이상이면 갑작스러운 threat 증가로 간주
 BURST_QDOT_TH = 0.80
@@ -203,14 +229,14 @@ MAX_OVERLAP_PUSH = 0.02
 
 # active desired direction이 벽 밖을 향하면 normal 성분을 제거하고 tangent를 유지.
 R_WALL_FLOW = 0.25
+# v0.4.16 front-wall split depth reuses existing R_SOCIAL; no new split-range parameter.
 
 # ----------------------------------------------------------------------------
-# Rare behavioral near-nonresponders
-# 약 0.5%는 robot/social behavioral sensitivity를 모두 0으로 둔다.
-# 실제 chicken/robot contact 및 crowd pressure에 의한 물리 이동은 정상.
+# Low-sensitivity tail diagnostic only
+# No bird is manually modified. With Beta(5.0, 6.25), sensitivity < 0.10 is
+# expected to be a very small tail (~order of 1-2 birds per 1000).
 # ----------------------------------------------------------------------------
-LOW_RESPONDER_RATE        = 0.005
-LOW_RESPONDER_RATE_JITTER = 0.001
+SLOW_RESPONSE_SENS_THRESHOLD = 0.10
 
 # ----------------------------------------------------------------------------
 # Spatial grid
@@ -226,6 +252,12 @@ ROBOT_ENABLED = True
 ROBOT_RADIUS  = 0.25
 ROBOT_START   = np.array([-1.0, 2.25])
 ROBOT_VEL     = np.array([0.20, 0.0])
+
+# ----------------------------------------------------------------------------
+# Diagnostics only: robot-wake occupancy window (behavior에 영향 없음)
+# ----------------------------------------------------------------------------
+WAKE_DIAG_LENGTH = 1.0
+WAKE_DIAG_HALF_WIDTH = ROBOT_RADIUS + CHICKEN_RADIUS
 
 # renderer의 기존 stimulus-ring 호환용.
 # 이제 중심거리 기준 ring은 direct cue가 0이 되는 surface-clearance 경계를 표시한다.
@@ -264,4 +296,4 @@ LOG_ENABLED = True
 LOG_EVERY   = 1
 LOG_DIR     = "logs"
 
-RANDOM_SEED = 42
+RANDOM_SEED = None
